@@ -1,14 +1,22 @@
 import sys
 import traceback
+from copy import copy
 from functools import partial
-from threading import Thread
 
 import wx
+import wx.lib.sized_controls
 from pubsub import pub
 
 from . import operations, process_files
-from .model import File, Status
+from .model import *
 from .operations import msg
+
+try:
+    from os import startfile
+except ImportError:
+
+    def startfile(*args, **kwargs):
+        pass
 
 
 class CustomDropTarget(wx.FileDropTarget):
@@ -41,37 +49,6 @@ class CustomDropTarget(wx.FileDropTarget):
         self.DefaultAction = wx.DragResult.DragCopy
 
 
-class CustomThread(Thread):
-    def __init__(self, *args):
-        super().__init__(daemon=True)
-        self.args = args
-        self.start()
-
-    def run(self, *args):
-        try:
-            self._run(*args)
-        except Exception:
-            msg(
-                "fatalError",
-                e=traceback.format_exception(*sys.exc_info()),
-                ctx=(self.__class__.__name__, self.args),
-            )
-            raise
-
-
-class DiscoverThread(CustomThread):
-    def _run(self):
-        (iterator,) = self.args
-        for file, outfile in iterator:
-            msg("discoverFile", file=file, outfile=outfile)
-        msg("discoverDone")
-
-
-class LoadSessionThread(CustomThread):
-    def _run(self):
-        msg("sessionLoaded", session=operations.load_session())
-
-
 class MainFrame(wx.Frame):
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
@@ -80,9 +57,10 @@ class MainFrame(wx.Frame):
         self.files = []
         self.files_seen = set()
         self.task_queue = []
-        self.dialog = None
-        self.session = None
+        self.discover_threads = 0
+        self.settings = Settings()
 
+        self.session = operations.new_session()
         self.DropTarget = CustomDropTarget(self)
         self.makeMenuBar()
         self.CreateStatusBar()
@@ -101,28 +79,49 @@ class MainFrame(wx.Frame):
         pub.subscribe(self.done_iterator, "discoverDone")
         pub.subscribe(self.fatalError, "fatalError")
         pub.subscribe(self.update_files, "update_files")
-        pub.subscribe(self.sessionLoaded, "sessionLoaded")
+        pub.subscribe(self.model_sessions_loaded, "model_sessions_loaded")
 
         self.Bind(wx.EVT_CHAR_HOOK, self.OnKeyUP)
 
-        wx.CallAfter(LoadSessionThread)
+        wx.CallAfter(operations.load_model_sessions)
 
     def makePanel(self):
         self.pnl = wx.Panel(self)
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        btn_files = wx.Button(self.pnl, label="Open Files")
-        btn_dirs = wx.Button(self.pnl, label="Open Folder")
-        self.Bind(wx.EVT_BUTTON, self.OnBtnFiles, btn_files)
-        self.Bind(wx.EVT_BUTTON, self.OnBtnDirs, btn_dirs)
+        flags = wx.UP | wx.LEFT
+        border = 15
+        sizer_flags = wx.SizerFlags().Border(flags, border)
 
         sizer2 = wx.BoxSizer(wx.HORIZONTAL)
-        sizer2.Add(btn_files, wx.SizerFlags().Border(wx.ALL, 15))
-        sizer2.Add(btn_dirs, wx.SizerFlags().Border(wx.ALL, 15))
+
+        btn = wx.Button(self.pnl, label="Open Files")
+        self.Bind(wx.EVT_BUTTON, self.OnBtnFiles, btn)
+        sizer2.Add(btn, sizer_flags)
+
+        btn = wx.Button(self.pnl, label="Open Folder")
+        self.Bind(wx.EVT_BUTTON, self.OnBtnDirs, btn)
+        sizer2.Add(btn, sizer_flags)
+
+        sizer.Add(sizer2, 0)
+        sizer2 = wx.BoxSizer(wx.HORIZONTAL)
+
+        btn = wx.Button(self.pnl, label="Set Model")
+        self.Bind(wx.EVT_BUTTON, self.OnBtnSetModel, btn)
+        sizer2.Add(btn, sizer_flags)
+
+        btn = wx.Button(self.pnl, label="Set Background")
+        self.Bind(wx.EVT_BUTTON, self.OnBtnSetBackground, btn)
+        sizer2.Add(btn, sizer_flags)
+
+        btn = wx.Button(self.pnl, label="Clear Completed")
+        self.Bind(wx.EVT_BUTTON, self.OnBtnClear, btn)
+        sizer2.Add(btn, sizer_flags)
+
         sizer.Add(sizer2, 0)
 
         st = wx.StaticText(self.pnl, label="Drag and drop files and folders here")
-        sizer.Add(st, 0, wx.ALL, 15)
+        sizer.Add(st, sizer_flags)
 
         self.queue = wx.ListCtrl(self.pnl, style=wx.LC_REPORT | wx.LC_VIRTUAL)
         self.queue.AppendColumn("File", width=300)
@@ -130,7 +129,8 @@ class MainFrame(wx.Frame):
         self.queue.AppendColumn("Status", width=70)
         self.queue.OnGetItemText = self.getItemText
         self.queue.SetItemCount(10)
-        sizer.Add(self.queue, 1, wx.EXPAND | wx.ALL, 20)
+        self.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.itemClicked, self.queue)
+        sizer.Add(self.queue, 1, wx.EXPAND | wx.RIGHT | flags, border)
 
         self.pnl.Sizer = sizer
         self.sizer.Add(self.pnl, 1, wx.EXPAND)
@@ -141,6 +141,15 @@ class MainFrame(wx.Frame):
 
         item = self.files[item]
         return str((item.file, item.outfile, item.status.name)[column])
+
+    def itemClicked(self, event):
+        try:
+            file = self.files[event.Index]
+        except IndexError:
+            return
+
+        if file.status == Status.Done:
+            startfile(file.outfile.parent)
 
     def fatalError(self, e, ctx):
         wx.MessageBox(
@@ -158,10 +167,10 @@ class MainFrame(wx.Frame):
         self.update_status()
 
     def update_status(self):
-        if self.dialog:
+        if self.discover_threads > 0:
             text = "Discovering files..."
-        elif not self.session:
-            text = "Loading model..."
+        elif not self.session.model_sessions:
+            text = "Loading models..."
         elif any(file.status not in {Status.Done, Status.Error} for file in self.files):
             text = "Processing files..."
         else:
@@ -187,6 +196,9 @@ class MainFrame(wx.Frame):
 
     def makeMenuBar(self):
         fileMenu = wx.Menu()
+
+        fileMenu.Append(-1, "Version: 2").Enabled = False
+        fileMenu.AppendSeparator()
 
         openFileItem = fileMenu.Append(-1, "&Open File...\tCtrl-O")
         self.Bind(wx.EVT_MENU, self.OnBtnFiles, openFileItem)
@@ -227,34 +239,51 @@ class MainFrame(wx.Frame):
                 return
             self.process_iterator(process_files.open_folder(dialog.Path))
 
+    def OnBtnSetModel(self, event):
+        with wx.SingleChoiceDialog(self, "", "Select model", ModelTypeList) as dialog:
+            dialog.SetSelection(ModelTypeList.index(self.settings.model.name))
+            if dialog.ShowModal() == wx.ID_CANCEL:
+                return
+            self.settings.model = ModelType[ModelTypeList[dialog.GetSelection()]]
+
+    def OnBtnSetBackground(self, event):
+        with wx.SingleChoiceDialog(
+            self, "", "Select background", BGColorList
+        ) as dialog:
+            dialog.SetSelection(BGColorList.index(self.settings.bgcolor.name))
+            if dialog.ShowModal() == wx.ID_CANCEL:
+                return
+            self.settings.bgcolor = BGColor[BGColorList[dialog.GetSelection()]]
+
+    def OnBtnClear(self, event):
+        to_keep = []
+        for file in self.files:
+            if file.status == Status.Done:
+                self.files_seen.discard(file.file)
+            else:
+                to_keep.append(file)
+
+        self.files = to_keep
+        self.update_files()
+
     def DropCallbackFiles(self, files):
         self.DropCallbackLeave()
         self.process_iterator(process_files.open_mixed(files))
 
     def process_iterator(self, iterator):
-        if self.dialog:
-            print("cannot process files while busy")
-            return
-
-        self.DropTarget.disable()
-        self.dialog = wx.ProgressDialog("Busy", "Discovering files")
-        self.dialog.Pulse()
+        self.discover_threads += 1
         self.update_status()
 
-        wx.CallAfter(DiscoverThread, iterator)
+        wx.CallAfter(operations.queue_discover, self.session, iterator)
 
     def done_iterator(self):
-        self.DropTarget.enable()
+        self.discover_threads -= 1
 
-        if self.dialog:
-            self.dialog.Destroy()
-
-        self.dialog = None
         self.update_status()
 
-    def sessionLoaded(self, session):
-        assert session
-        self.session = session
+    def model_sessions_loaded(self, model_sessions):
+        assert model_sessions
+        self.session.model_sessions = model_sessions
         self.update_status()
         wx.CallAfter(self.check_task_queue)
 
@@ -272,11 +301,11 @@ class MainFrame(wx.Frame):
         wx.CallAfter(self.check_task_queue)
 
     def check_task_queue(self):
-        if self.session is None:
+        if self.session.model_sessions is None:
             return
 
         for file in self.task_queue:
-            operations.queue_file(self.session, file)
+            operations.queue_file(self.session, file, self.settings)
         self.task_queue.clear()
 
     def DropCallbackEnter(self):

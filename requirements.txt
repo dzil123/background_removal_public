@@ -1,0 +1,8 @@
+gdown
+numpy
+onnxruntime
+pillow
+pymatting
+PyPubSub
+scipy
+wxPython
